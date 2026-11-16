@@ -110,11 +110,15 @@ _update_state = {"stage": "idle", "percent": 0, "done": 0, "total": 0,
 _pending_update = {"url": "", "sha256": "", "version": ""}
 
 # 内嵌考试浏览器：由桌面入口注入窗口对象，这里负责盯着它的地址栏
-_exam_browser = {"window": None, "url": "", "enc": "", "answer_id": "", "exam_id": ""}
+_exam_browser = {"window": None, "url": "", "enc": "", "answer_id": "", "exam_id": "",
+                 # 清空状态后的一小段时间内，地址栏里还是上一场的 URL，
+                 # 后台观察线程会把旧 enc 写回来 → 前端立刻开始答上一场。
+                 "ignore_until": 0.0}
 # 退出钩子：桌面入口注入，更新要重启时用它走正常的退出流程
 _quit_hook = {"fn": None}
 _state = {
     "proc": None,
+    "starting": False,
     "logs": deque(maxlen=6000),
     "chapters": {},
     "seq": 0,
@@ -126,7 +130,7 @@ _state = {
         "status": "idle",      # idle / running / waiting_face / done / error
         "name": "",
         "answered": 0,
-        "submitted": False,    # done 时才有意义：是否真的交卷了
+        "submitted": False,    # 恒为 False：交卷由使用者手动完成，这里只保留字段兼容前端
         "error": "",
         "face_ok": False,
         "driving": False,
@@ -164,8 +168,7 @@ def _write_config(cfg: dict, path: Path | None = None, with_secrets: bool = Fals
             "target_count": "100",
             "target_accuracy": str(max(60, min(100, int(cfg.get("target_accuracy", 100) or 100)))),
             "exam_answer_gap": str(max(0.0, min(30.0, float(cfg.get("exam_answer_gap", 3) or 0)))),
-            "exam_min_minutes": str(max(0.0, min(180.0, float(cfg.get("exam_min_minutes", 0) or 0)))),
-            "exam_hold_seconds": str(max(0.0, min(120.0, float(cfg.get("exam_hold_seconds", 0) or 0)))),
+            "exam_conf_gate": str(max(0.5, min(0.95, float(cfg.get("exam_conf_gate", 0.78) or 0.78)))),
         }
     )
     parser["tiku"].update(
@@ -245,8 +248,7 @@ def _read_config() -> dict:
         "min_interval": _num(tiku.get("min_interval_seconds"), 2, int),
         "target_accuracy": _num(common.get("target_accuracy"), 100, int),
         "exam_answer_gap": _num(common.get("exam_answer_gap"), 3.0),
-        "exam_min_minutes": _num(common.get("exam_min_minutes"), 0.0),
-        "exam_hold_seconds": _num(common.get("exam_hold_seconds"), 0.0),
+        "exam_conf_gate": _num(common.get("exam_conf_gate"), 0.78),
         "submit": tiku.get("submit", "true").lower() == "true",
         "model": tiku.get("model", "deepseek-chat"),
         "vision_model": tiku.get("vision_model", ""),
@@ -344,6 +346,22 @@ def set_exam_window(window) -> None:
     _exam_browser["window"] = window
 
 
+def _exam_stage():
+    """拿考场窗口的嵌入控制器；拿不到就返回 None。
+
+    以前这里直接写 `exam_embed.get(...)`，但 server.py 从没导入过 exam_embed，
+    每次都在 try 里抛 NameError 被吞掉 —— 表现为「登录窗口一直弹成独立窗口」。
+    统一走这个函数，失败也不再是静默的。
+    """
+    try:
+        from api import exam_embed
+
+        return exam_embed.get("exam")
+    except Exception as exc:  # 非 Windows / 模块缺失
+        _append_log(f"嵌入控制器不可用：{exc}", kind="ui")
+        return None
+
+
 def set_quit_hook(fn) -> None:
     """桌面入口把「按正常流程退出」的函数交过来。"""
     _quit_hook["fn"] = fn
@@ -403,6 +421,8 @@ def _watch_exam_browser() -> None:
         answer_id = (query.get("id") or [""])[0]
         exam_id = (query.get("tId") or [""])[0]
         with _lock:
+            if time.time() < _exam_browser.get("ignore_until", 0):
+                continue
             _exam_browser["url"] = url
             if enc:
                 _exam_browser["enc"] = enc
@@ -423,18 +443,48 @@ def api_exam_browser_open():
         return jsonify(ok=False,
                        error="内嵌浏览器不可用，请在浏览器里手动进入考试后点「接管」"), 400
     with _lock:
-        _exam_browser.update(url="", enc="", answer_id="", exam_id="")
+        _exam_browser.update(url="", enc="", answer_id="", exam_id="",
+                             ignore_until=time.time() + 5.0)
     # 用户可能刚在设置里登录过，先把最新的 cookie 推进浏览器再导航
+    cookie_count = 0
     try:
         from api import browser_unlock
 
-        browser_unlock.sync_cookies(win, "考场浏览器", force=True)
-    except Exception:
-        pass
+        # 请求线程不能裸等 WebView2：sync_cookies 内部是阻塞的 form.Invoke，
+        # UI 线程一忙就会把 Flask 工作线程一起拖死，最后整个界面都不回。
+        # ignore 窗口同步拉长到覆盖这段等待：否则观察线程在 5 秒后就会把
+        # 导航前的旧考试 URL（带旧 enc）写回来，前端拿到旧 enc 立即误开作答。
+        cookie_count = _run_with_deadline(
+            lambda: browser_unlock.sync_cookies(win, "考场浏览器", force=True), 15)
+        with _lock:
+            _exam_browser["ignore_until"] = time.time() + 5.0
+    except TimeoutError:
+        return jsonify(ok=False, error="考场窗口 15 秒没有响应，请关掉考场再重新打开"), 504
+    except Exception as exc:
+        _append_log(f"同步登录态失败：{exc}", kind="ui")
+
+    # 本地明明有登录态，却一条都没推进 WebView2：这时候导航过去只会落在登录页，
+    # 用户看到的就是「考场打不开 / 登录不进去」。直接说清楚，别让他干等。
+    cookie_file = ROOT / "cookies.txt"
+    has_cookie_file = cookie_file.exists() and cookie_file.stat().st_size > 0
+    if cookie_count == 0 and has_cookie_file:
+        return jsonify(ok=False, error=(
+            "登录态没能送进考场窗口（窗口可能还没初始化好）。"
+            "请点「登录学习通」重新登录一次，或展开「打开其他页面」手动进入考场")), 502
+    if cookie_count > 0:
+        _append_log(f"已把 {cookie_count} 条登录态推进考场窗口", kind="ui")
+
     try:
-        win.load_url(url or "https://mooc1.chaoxing.com/")
+        _run_with_deadline(lambda: win.load_url(url or "https://mooc1.chaoxing.com/"), 10)
+    except TimeoutError:
+        return jsonify(ok=False, error="导航超时：窗口可能已经无响应，建议关掉考场重开"), 504
     except Exception as exc:
         return jsonify(ok=False, error=f"打不开浏览器窗口：{exc}"), 500
+    # 导航已经发出去：从现在起观察线程看到的 URL 才算数。再给 5 秒忽略窗，
+    # 避免把导航前地址栏里残留的旧考试地址（带旧 enc）当成新状态写回来。
+    with _lock:
+        _exam_browser.update(url="", enc="", answer_id="", exam_id="",
+                             ignore_until=time.time() + 5.0)
     # 嵌进页面里时不主动 show：那个窗口现在是主窗口的子窗口，
     # 先显示会以 0,0 贴在左上角盖住标题栏，等前端把区域坐标报上来再摆。
     try:
@@ -477,11 +527,18 @@ def api_exam_browser_close():
         pass
     if win is not None:
         try:
-            win.load_url("about:blank")
+            _run_with_deadline(lambda: win.load_url("about:blank"), 8)
         except Exception:
             pass
     with _lock:
-        _exam_browser.update(url="", enc="", answer_id="", exam_id="")
+        _exam_browser.update(url="", enc="", answer_id="", exam_id="",
+                             ignore_until=time.time() + 5.0)
+    # 用户点「登录学习通」后直接收起窗口（放弃登录）时，登录态还躺在 .bak 里。
+    # 不搬回来，界面就永远显示未登录。live 存在时这个函数不会动任何东西。
+    try:
+        _rescue_login_backup()
+    except Exception:
+        pass
     return jsonify(ok=True)
 
 
@@ -511,24 +568,64 @@ def api_exam_autodrive():
             return jsonify(ok=False, error="已经在自动作答了"), 409
         if _state["proc"] is not None:
             return jsonify(ok=False, error="刷课任务正在运行，请先停止再开始考试"), 409
-        _state["exam"].update(driving=True, status="running", answered=0, error="")
+        # /api/start 从置 starting 到真正 Popen 之间还有几十秒的核对与写盘，
+        # 这期间 proc 仍是 None——不挡这一条就能边刷课边答题，两边互踩。
+        if _state.get("starting"):
+            return jsonify(ok=False, error="刷课任务正在启动，等它开始后再考试"), 409
+        _state["exam"].update(driving=True, status="running", answered=0, error="",
+                              submitted=False, face_ok=False,
+                              gen=_state["exam"].get("gen", 0) + 1)
+        gen = _state["exam"]["gen"]
 
     data = request.get_json(force=True, silent=True) or {}
     course = str(data.get("course") or "").strip()
-    threading.Thread(target=_drive_exam, args=(win, course), daemon=True).start()
+    worker = threading.Thread(target=_drive_exam, args=(win, course), daemon=True)
+    with _lock:
+        _state["exam"]["worker"] = worker
+    worker.start()
+    # 看门狗：答题线程万一卡在原生弹窗上，finally 永远不执行，driving 会一直是
+    # True，之后每次点考试都 409「已经在自动作答了」，只能重启程序。
+    threading.Thread(target=_exam_watchdog, args=(gen,), daemon=True).start()
     return jsonify(ok=True, message="已开始自动作答")
+
+
+def _exam_watchdog(gen: int, minutes: float = 35.0) -> None:
+    """盯住答题线程。
+
+    以前是固定睡 35 分钟然后无条件解锁。但 run_pass 会按题数把内部时限放宽
+    （150 题 × 每题间隔 30s 时要一个多小时），固定 35 分钟会在答题进行到一半时
+    解锁 driving，用户再点一次「开始」就变成两条 run_pass 同时驱动同一个
+    WebView2。现在线程还活着就继续等，只在它真的死了或换场之后才收尾，
+    外加一个 3 小时的绝对上限兜底。
+    """
+    deadline = time.time() + 3 * 3600
+    while time.time() < deadline:
+        time.sleep(30)
+        with _lock:
+            exam = _state["exam"]
+            if exam.get("gen") != gen or not exam.get("driving"):
+                return
+            worker = exam.get("worker")
+            if worker is None or not worker.is_alive():
+                # 线程已经结束（正常或异常），finally 自己会收尾；这里兜底
+                exam.update(driving=False, status="error",
+                            error="自动作答线程已退出但状态未复位，已解锁")
+                _append_log("自动作答线程退出但状态没复位，已强制解锁", kind="ui")
+                return
 
 
 def _drive_exam(win, course: str = "") -> None:
     def log(msg: str) -> None:
         _append_log(msg)
 
+    # 放在 try 外面：import 失败时 except 里也要用到它，否则会抛 UnboundLocalError
+    # 把真正的错误吞掉。
+    started = time.time()
     try:
         # import 放在 try 里面：模块缺失时线程会静默死掉，
         # driving 一直为 True，之后再点考试全是 409。
         from api.browser_exam import run_pass
 
-        started = time.time()
         log("开始在考试窗口里自动作答")
         stats = run_pass(win, log, course=course)
         elapsed = int(time.time() - started)
@@ -538,12 +635,15 @@ def _drive_exam(win, course: str = "") -> None:
         log(f"自动作答结束（{elapsed} 秒）：作答 {stats.get('ok', 0)} 题，"
             f"未完成 {stats.get('fail', 0)} 题，剩余未答 {stats.get('left', 0)} 题")
         if stats.get("error"):
-            # 一开始就没读到卷面，别让「剩余 0 题」看起来像全做完了
+            # 一开始就没读到卷面，别让「剩余 0 题」看起来像全做完了。
+            # 同时把错误落到状态里，前端才不会把它显示成「未交卷」。
+            with _lock:
+                _state["exam"]["error"] = str(stats["error"])
             log(f"自动作答没能开始：{stats['error']}")
-        elif stats.get("submitted"):
-            log("已自动交卷")
-        elif stats.get("left", 0) == 0:
-            log("全部题目已作答，但自动交卷没成功——请在考试窗口里手动点交卷")
+        elif stats.get("ready") or stats.get("left", 0) == 0:
+            log("全部题目已作答，请在考场窗口里检查后手动交卷")
+        else:
+            log(f"还有 {stats.get('left', 0)} 题没答完，请到考场窗口补齐后再交卷")
     except Exception as exc:
         with _lock:
             _state["exam"].update(error=f"{type(exc).__name__}: {exc}")
@@ -808,9 +908,13 @@ def _run_child(flag: str, tag: str, timeout: float) -> dict:
     """
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
-    out_path = Path(tempfile.gettempdir()) / f"chaoxing_{tag}.json"
+    # 固定文件名会被并发子进程互相覆盖：/api/login/collect 和 /api/start 都会调
+    # --whoami，两个子进程写同一个文件时，读的一方可能读到别人的结果甚至半截 JSON。
+    fd, out_name = tempfile.mkstemp(prefix=f"chaoxing_{tag}_", suffix=".json")
+    os.close(fd)
+    out_path = Path(out_name)
     try:
-        out_path.unlink()
+        out_path.unlink()      # 让子进程自己创建，避免读到 mkstemp 留下的空文件
     except OSError:
         pass
     if FROZEN:
@@ -820,11 +924,31 @@ def _run_child(flag: str, tag: str, timeout: float) -> dict:
         # 免得开发者机器上少了 .venv 就整条链路报「找不到文件」
         python = str(PYTHON) if Path(PYTHON).exists() else sys.executable
         cmd = [python, str(ROOT / "desktop.py"), flag, str(out_path)]
-    subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
-                   encoding="utf-8", errors="replace", env=env, timeout=timeout)
+    try:
+        # subprocess.run 超时抛的是 TimeoutExpired，不是 TimeoutError；
+        # 不转一道的话调用方的 except TimeoutError 接不住，用户看到的是
+        # 500 加一段英文异常名。
+        subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+        raise TimeoutError(f"子进程 {flag} 超过 {int(timeout)} 秒没有返回，请稍后重试") from exc
     if not out_path.exists():
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
         raise RuntimeError("子进程没有写出结果，请重试")
-    return json.loads(out_path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(out_path.read_text(encoding="utf-8"))
+    finally:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
 
 
 def _whoami() -> dict:
@@ -846,6 +970,91 @@ def _pull_exams() -> dict:
 LOGIN_URL = ("https://passport2.chaoxing.com/login"
              "?fid=&refer=https%3A%2F%2Fi.chaoxing.com")
 
+# 登录是一次「有风险的操作」：要先清掉旧登录态才能换号。
+# 清之前把文件挪成 .bak，万一登录没成，原样搬回来 —— 不能因为一次失败的登录
+# 把用户本来能用的会话弄丢。
+_pending_login_backup = {}
+
+
+def _backup_login_state() -> dict:
+    saved = {}
+    for name in ("cookies.txt", "login.json"):
+        path = ROOT / name
+        if not path.exists():
+            continue
+        bak = ROOT / (name + ".bak")
+        try:
+            os.replace(path, bak)
+            saved[name] = bak
+        except OSError as exc:
+            _append_log(f"备份 {name} 失败：{exc}", kind="ui")
+    return saved
+
+
+def _restore_login_state(saved: dict) -> bool:
+    """把备份搬回原位。返回是否真的恢复了至少一份。"""
+    restored = False
+    for name, bak in (saved or {}).items():
+        try:
+            os.replace(bak, ROOT / name)
+            restored = True
+        except OSError as exc:
+            _append_log(f"恢复 {name} 失败：{exc}", kind="ui")
+    return restored
+
+
+def _drop_login_backup(saved: dict) -> None:
+    for bak in (saved or {}).values():
+        try:
+            bak.unlink()
+        except OSError as exc:
+            # 删不掉不能一声不吭：留着 .bak，下一次回滚就可能把新登录覆盖回旧账号
+            _append_log(f"删除登录备份失败（{bak.name}）：{exc}", kind="ui")
+
+
+def rescue_login_backup_on_quit() -> None:
+    """程序退出时把滞留的登录备份搬回原位（live 存在时不动任何东西）。"""
+    _rescue_login_backup()
+
+
+# 服务启动时先救一次：上次点完「登录学习通」没登录就关了程序的话，
+# cookies.txt 还躺在 .bak 里，不救的话界面一上来就是「未登录」。
+try:
+    _rescue_login_backup()
+except Exception:
+    pass
+
+
+def _login_fail(message: str, code: int = 400):
+    """登录没成功：把清掉的旧登录态还回去，再回一句人话。"""
+    global _pending_login_backup
+    with _login_lock:
+        restored = _restore_login_state(_pending_login_backup)
+        _pending_login_backup = {}
+    suffix = "（你原来的登录态已恢复，可以直接刷课）" if restored else ""
+    return jsonify(ok=False, error=message + suffix), code
+
+
+# 登录流程互斥：备份文件的搬迁和 _pending_login_backup 的读改写必须串行，
+# 否则连点两次「登录学习通」会互相覆盖，把用户原来的登录态弄丢。
+_login_lock = threading.Lock()
+
+
+def _rescue_login_backup() -> None:
+    """上次在「打开登录页」和「我已登录」之间退出时，把 .bak 搬回原位。
+
+    不做这一步，用户的登录态就永远躺在备份文件里，界面还显示未登录。
+    """
+    for name in ("cookies.txt", "login.json"):
+        bak = ROOT / (name + ".bak")
+        live = ROOT / name
+        if bak.exists() and not live.exists():
+            try:
+                os.replace(bak, live)
+                _append_log(f"已恢复上次中断的登录态（{name}）", kind="ui")
+            except OSError:
+                pass
+
 
 @app.post("/api/login/open")
 def api_login_open():
@@ -861,27 +1070,42 @@ def api_login_open():
 
     # 换账号必须先清干净：本地 cookies.txt 和浏览器自己的 cookie 库
     # 任何一处留着旧账号，登录页就会直接以旧账号进去，用户以为换了其实没换。
-    try:
-        (ROOT / "cookies.txt").unlink()
-    except OSError:
-        pass
-    try:
-        (ROOT / "login.json").unlink()
-    except OSError:
-        pass
+    # 但清之前先备份，登录失败要能原样还原。
+    global _pending_login_backup
+    _rescue_login_backup()
+    # 刷课子进程手里握着自己的一份会话，收尾时会把 cookie 写回文件。
+    # 这时候换账号，等于让子进程用旧号覆盖新号，或者两边同时写出半截文件。
+    with _lock:
+        if _state["proc"] is not None:
+            return jsonify(ok=False, error="刷课任务正在运行，请先停止再换账号"), 409
+    # 连点两次「登录学习通」时，第一次已经把 cookies.txt 挪走了，第二次再备份
+    # 只会拿到空字典，把第一次的备份变成孤儿 —— 登录失败就再也还原不回来。
+    # 检查和备份放在同一把锁里，避免两个请求同时判断「还没有备份」。
+    with _login_lock:
+        if not _pending_login_backup:
+            _pending_login_backup = _backup_login_state()
     try:
         _run_with_deadline(lambda: browser_unlock.clear_cookies(win), 20)
     except Exception as exc:
         _append_log(f"清空旧登录态失败（继续打开登录页）：{exc}", kind="ui")
 
     try:
-        win.load_url(LOGIN_URL)
+        _run_with_deadline(lambda: win.load_url(LOGIN_URL), 10)
+    except TimeoutError:
+        # 回滚必须和备份、collect 的写盘共用 _login_lock：
+        # 否则 collect 恰好写完新 cookie 时，这里的 os.replace 会把新登录
+        # 覆盖回旧账号，串号就从这个窗口溜回来。
+        with _login_lock:
+            _restore_login_state(_pending_login_backup)
+            _pending_login_backup = {}
+        return jsonify(ok=False, error="登录页导航超时（你原来的登录态已恢复），请重试"), 504
     except Exception as exc:
-        return jsonify(ok=False, error=f"打不开登录页：{exc}"), 500
-    try:
-        placed = exam_embed.get("exam").set_active(True)
-    except Exception:
-        placed = False
+        with _login_lock:
+            _restore_login_state(_pending_login_backup)
+            _pending_login_backup = {}
+        return jsonify(ok=False, error=f"打不开登录页：{exc}（你原来的登录态已恢复）"), 500
+    stage = _exam_stage()
+    placed = bool(stage and stage.set_active(True))
     if not placed:
         try:
             win.show()
@@ -919,6 +1143,18 @@ def _probe_login(cookies: dict) -> dict:
         return {"status": False, "msg": f"{type(exc).__name__}: {exc}"}
     if resp.status_code != 200:
         return {"status": False, "msg": f"平台返回 {resp.status_code}"}
+
+    # 登录失效时平台往往回一个 200 的登录页，只看状态码会误判成功。
+    # 只认强特征（登录表单/跳回 passport）。「用户登录」「请输入手机号」这类
+    # 通用词不碰——课程列表正文里出现一次就会把有效登录判死，用户被锁进
+    # 登录死循环。认不出强特征就当成功：宁可放过一次，不要错杀。
+    body = (resp.text or "")[:4000]
+    final_url = str(getattr(resp, "url", "") or "")
+    if "passport2.chaoxing.com" in final_url:
+        return {"status": False, "msg": "被跳转回登录页，登录态已失效"}
+    for marker in ('name="fanyalogin"', 'id="loginName"', 'name="password"'):
+        if marker in body:
+            return {"status": False, "msg": "平台返回的是登录页，登录态已失效"}
     return {"status": True, "msg": "登录成功"}
 
 
@@ -950,37 +1186,29 @@ def api_login_collect():
     if win is None:
         return jsonify(ok=False, error="登录窗口不可用，请重启程序"), 400
 
+    with _lock:
+        if _state["proc"] is not None:
+            return jsonify(ok=False, error="刷课任务正在运行，请先停止再换账号"), 409
+
     from api import browser_unlock
 
     try:
         cookies = _run_with_deadline(lambda: browser_unlock.read_cookies(win), 30)
     except TimeoutError as exc:
-        return jsonify(ok=False, error=f"读取窗口登录状态超时：{exc}"), 504
+        return _login_fail(f"读取窗口登录状态超时：{exc}", 504)
     if not cookies:
         # 不能沿用旧登录态：那样会出现「界面看着是 B，跑起来用的是 A」。
         # 读不到就让用户重来，宁可多一次点击，也不要串号。
-        return jsonify(ok=False,
-                       error="没读到窗口里的登录信息，请确认窗口里已登录成功后再点一次"), 400
+        return _login_fail("没读到窗口里的登录信息，请确认窗口里已登录成功后再点一次")
     if not (cookies.get("_uid") or cookies.get("UID")):
-        return jsonify(ok=False,
-                       error="看起来还没登录成功：窗口里看不到登录后的标识"), 400
+        return _login_fail("看起来还没登录成功：窗口里看不到登录后的标识")
 
     text = ";".join(f"{name}={value}" for name, value in cookies.items())
     # 先把窗口收起来：登录页一直在渲染会占满 GIL，后台的拉取会被拖慢几十倍
-    try:
-        exam_embed.get("exam").set_active(False)
-    except Exception:
-        pass
-    try:
-        (ROOT / "cookies.txt").write_text(text, encoding="utf-8")
-    except OSError as exc:
-        return jsonify(ok=False, error=f"保存登录状态失败：{exc}"), 500
-    try:
-        from api.base import SessionManager
-
-        SessionManager.get_instance()._session.cookies.update(cookies)
-    except Exception:
-        pass
+    stage = _exam_stage()
+    if stage:
+        stage.set_active(False)
+    # 注意：这里先不落盘。校验通过之后才写，见下面 probe 之后那一段。
 
     # 之后统一走 cookie 登录：只改这一个键，配置里其他内容原样保留
     if CONFIG_PATH.exists():
@@ -1001,12 +1229,37 @@ def api_login_collect():
     try:
         state = _run_with_deadline(lambda: _probe_login(cookies), 30)
     except TimeoutError as exc:
-        return jsonify(ok=False, error=f"校验登录状态超时：{exc}"), 504
+        return _login_fail(f"校验登录状态超时：{exc}", 504)
     except Exception as exc:
-        return jsonify(ok=False, error=f"校验登录状态失败：{exc}"), 500
+        return _login_fail(f"校验登录状态失败：{exc}", 500)
     if not state.get("status"):
-        return jsonify(ok=False,
-                       error=f"登录状态用不了：{state.get('msg')}"), 400
+        return _login_fail(f"登录状态用不了：{state.get('msg')}")
+
+    # 校验通过才落盘：先写临时文件再原子替换。以前是「先写再验」，
+    # 第一次登录失败时会把一份无效 cookie 留在盘上，下次打开考场反而
+    # 把用户刚在窗口里登录好的会话踢下线。
+    tmp_path = ROOT / "cookies.txt.tmp"
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        os.replace(tmp_path, ROOT / "cookies.txt")
+    except OSError as exc:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return jsonify(ok=False, error=f"保存登录状态失败：{exc}"), 500
+    try:
+        from api.base import SessionManager
+
+        SessionManager.get_instance()._session.cookies.update(cookies)
+    except Exception:
+        pass
+
+    # 新登录态确认可用，旧备份可以删了
+    global _pending_login_backup
+    with _login_lock:
+        _drop_login_backup(_pending_login_backup)
+        _pending_login_backup = {}
 
     _append_log("已读取学习通登录状态", kind="ui")
     # 记下这份登录态属于谁：换账号或跑任务前用它核对，避免 A 的登录态跑 B 的活
@@ -1024,10 +1277,9 @@ def api_login_collect():
         except OSError:
             pass
     # 登录完了就把窗口收起来，别挡着页面
-    try:
-        exam_embed.get("exam").set_active(False)
-    except Exception:
-        pass
+    stage = _exam_stage()
+    if stage:
+        stage.set_active(False)
     name = str(who.get("name") or "")
     if name:
         return jsonify(ok=True,
@@ -1118,7 +1370,10 @@ def api_update_apply():
     data = request.get_json(force=True, silent=True) or {}
     url = str(data.get("url", "")).strip()
     sha = str(data.get("sha256", "")).strip()
-    version = str(data.get("version", "")).strip()
+    # 版本号只认「检查更新」时服务端给的那一份，不能信请求体：
+    # /api/update/restart 用它判断「新包是否比当前版本新」，客户端伪造一个
+    # version=9999 就能绕过这道检查。
+    version = str(_pending_update.get("version") or "").strip()
     if not url:
         return jsonify(ok=False, error="缺少下载地址"), 400
     # 只装「检查更新」发现的那个版本：地址和校验值都由服务端自己存过一份，
@@ -1386,6 +1641,26 @@ def api_courses():
 
 @app.post("/api/start")
 def api_start():
+    """防止「检查 + 启动」之间被第二个请求钻空子。
+
+    以前 _lock 在检查完就放了，Popen 在几十行之后（中间还有一次最长 60 秒的
+    账号核对）。界面上的按钮在 await 期间没有禁用，双击就会起两个刷课进程，
+    前一个变成没人管的孤儿继续交章节。
+    """
+    with _lock:
+        if _state["proc"] is not None or _state.get("starting"):
+            return jsonify(ok=False, error="已有任务在启动或运行中，请稍后"), 409
+        if _state["exam"].get("driving"):
+            return jsonify(ok=False, error="考试正在自动作答，请等结束再开始刷课"), 409
+        _state["starting"] = True
+    try:
+        return _start_task_locked()
+    finally:
+        with _lock:
+            _state["starting"] = False
+
+
+def _start_task_locked():
     cfg = _fill_secrets(request.get_json(force=True, silent=True) or {})
     with _lock:
         if _state["proc"] is not None:
@@ -1462,66 +1737,6 @@ def api_start():
 _EXAM_FACE_TIMEOUT = 300
 
 
-def _run_exam_thread(username, password, course, exam_id, enc_task, name,
-                     attach=False, retake=False, enc="", answer_id="") -> None:
-    """在后台跑一场考试；日志写进前端可见的通道。"""
-    import time as _time
-
-    def log(msg: str) -> None:
-        _append_log(msg)
-
-    def wait_face(_sess) -> bool:
-        with _lock:
-            _state["exam"]["status"] = "waiting_face"
-        log("本场考试需要人脸验证，请自行完成后再点「我已完成验证」")
-        for _ in range(_EXAM_FACE_TIMEOUT):
-            with _lock:
-                if _state["exam"]["face_ok"]:
-                    return True
-                if _state["exam"]["status"] != "waiting_face":
-                    return False
-            _time.sleep(1)
-        log("等待人脸验证超时，已停止")
-        return False
-
-    try:
-        from api.answer import DummyTiku
-        from api.base import Account, Chaoxing, SessionManager
-        from api.exam import run_exam
-
-        chaoxing = Chaoxing(
-            account=Account(username, password),
-            tiku=DummyTiku(),
-            query_delay=0,
-            work_max_retries=0,
-            work_redo_enabled=False,
-        )
-        state = chaoxing.login(login_with_cookies=False)
-        if not state.get("status"):
-            raise RuntimeError(f"登录失败：{state.get('msg')}")
-
-        session = SessionManager.get_session()
-        def progress(answered, seen):
-            with _lock:
-                _state["exam"]["answered"] = answered
-
-        def finish(submitted):
-            with _lock:
-                _state["exam"]["submitted"] = bool(submitted)
-
-        count = run_exam(session, course, exam_id, enc_task, log=log,
-                         wait_face=wait_face, on_progress=progress, on_finish=finish,
-                         attach=attach, retake=retake, enc=enc, answer_id=answer_id)
-        with _lock:
-            _state["exam"].update(status="done", answered=count)
-    except Exception as exc:
-        with _lock:
-            _state["exam"].update(status="error", error=f"{type(exc).__name__}: {exc}")
-        log(f"考试失败：{type(exc).__name__}: {exc}")
-    finally:
-        # 无论成功失败都要放开，否则「自动作答」按钮会一直被挡住
-        with _lock:
-            _state["exam"]["driving"] = False
 
 
 def _watchdog(proc: subprocess.Popen) -> None:
@@ -1755,7 +1970,6 @@ def api_agent_apply():
 def api_agent_upload():
     """把审查通过、而且原本就有硬证据的题上报共享题库。"""
     from api import agent as agent_mod
-    from api.library import Library
 
     try:
         rows = agent_mod.upload_candidates()

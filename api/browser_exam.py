@@ -11,9 +11,12 @@
 import json
 import random
 import re
+import threading
 import time
 
-from api.exam import ExamQuestion, ask_ai, ask_with_check, exam_pace, set_course_name
+from api.exam import (ExamQuestion, answer_objective, ask_ai, exam_pace,
+                      exam_stats, reset_exam_stats, set_course_name)
+from api.matcher import resolve
 
 TYPE_MAP_CN = {"单选题": "single", "多选题": "multiple", "判断题": "judgement",
                "填空题": "completion", "简答题": "shortanswer",
@@ -98,33 +101,31 @@ def clean_title(text: str) -> str:
     return t
 
 
-_EXEC = None
-
-
-def _executor():
-    """跨线程执行 evaluate_js 用；单例复用，避免每次调用都新建线程池。"""
-    global _EXEC
-    if _EXEC is None:
-        from concurrent.futures import ThreadPoolExecutor
-
-        _EXEC = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cx-eval")
-    return _EXEC
-
-
 def _js(win, script: str, timeout: float = 15.0):
     """执行页面 JS，带超时。
 
-    evaluate_js 是同步调用：页面一旦弹出原生 alert/confirm，JS 主线程被挂起，
-    这个调用就永远不返回，整条答题线程会死在这儿。超时后放弃等待，
-    让流程能继续走并把情况写进日志。
+    evaluate_js 是同步调用：页面弹出原生 alert/confirm 时 JS 主线程被挂起，
+    这个调用永远不返回。以前用固定线程池 + future.result(timeout)，超时只是
+    「不再等」，卡住的 worker 永远回不来；累计 4 次之后所有 _js 都立刻超时，
+    答题链路彻底失效，只能重启程序。
+    改成每次调用起一个守护线程：卡住只泄漏一个线程，后续调用不受影响。
     """
     if win is None:
         return None
-    try:
-        future = _executor().submit(win.evaluate_js, script)
-        return future.result(timeout=timeout)
-    except Exception:
-        return None
+    box: dict = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            box["value"] = win.evaluate_js(script)
+        except Exception:
+            box["error"] = True
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True, name="cx-eval").start()
+    done.wait(timeout)
+    return box.get("value")
 
 
 GUARD_JS = r"""
@@ -227,7 +228,13 @@ def goto_first(win, log=None) -> bool:
           "if(a&&(a.innerText||'').trim()==='1'){a.click();return 'ok';}}"
           "return 'notfound';})()")
     if _js(win, js, timeout=6.0) == "ok":
-        if wait_qid_change(win, old) or current_qid(win) == old:
+        # 点完之后必须确认真的停在第 1 题：以前「题号没变」也当成功，
+        # 结果本轮从卷子中间开始扫，前半张卷白跑。
+        changed = wait_qid_change(win, old)
+        cur = _js(win, "(function(){var c=document.querySelector("
+                       "'.answerSheetBox li.nav-revise.current a');"
+                       "return c?((c.innerText||'').trim()):'';})()", timeout=4.0) or ""
+        if changed or cur.strip() == "1":
             return True
 
     # 兜底：一路点上一题退回开头
@@ -264,12 +271,6 @@ def read_question(win):
         return json.loads(raw) if raw else None
     except Exception:
         return None
-
-
-def read_answer(win) -> str:
-    return _js(win, "(function(){var w=document.querySelector('.questionWrap');"
-                    "if(!w)return '';var a=w.querySelector(\"input[id^='answer']\");"
-                    "return a?a.value:'';})()") or ""
 
 
 def open_card(win) -> None:
@@ -318,73 +319,54 @@ def click_option(win, key: str) -> None:
 
 
 FILL_JS = r"""
-(function (text) {
+(function (parts) {
   var box = document.querySelector('.questionWrap') || document;
-  var el = box.querySelector('.fillAnswer input, .fillAnswer textarea')
-        || box.querySelector('textarea')
-        || box.querySelector('input[type=text]');
-  if (!el) return 'no-input';
-
+  var els = [].slice.call(box.querySelectorAll('.fillAnswer input, .fillAnswer textarea'));
+  if (!els.length) {
+    var only = box.querySelector('textarea') || box.querySelector('input[type=text]');
+    if (!only) return 'no-input';
+    els = [only];
+  }
   // React 受控组件只认原生 setter，直接改 value 不会触发 onChange
-  var proto = el.tagName === 'TEXTAREA'
-    ? window.HTMLTextAreaElement.prototype
-    : window.HTMLInputElement.prototype;
-  var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-
-  el.dispatchEvent(new Event('focus', {bubbles: true}));
-  setter.call(el, text);
-  el.dispatchEvent(new Event('input', {bubbles: true}));
-  el.dispatchEvent(new Event('change', {bubbles: true}));
-  el.dispatchEvent(new Event('blur', {bubbles: true}));
-  el.dispatchEvent(new Event('keyup', {bubbles: true}));
-  return (el.value || '').length ? 'ok' : 'empty';
+  function put(el, text) {
+    var proto = el.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    el.dispatchEvent(new Event('focus', {bubbles: true}));
+    setter.call(el, text);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    el.dispatchEvent(new Event('blur', {bubbles: true}));
+    el.dispatchEvent(new Event('keyup', {bubbles: true}));
+  }
+  // 多空题不能把整段答案灌进第一个空、其余空全留白（等于答非所问还显示已答）。
+  // 按空数把分段依次填进去；段数不够时空着并如实报告。
+  for (var i = 0; i < els.length; i++) {
+    var text = (parts.length > 1 && i < parts.length) ? parts[i] : parts[0];
+    if (parts.length > 1 && i >= parts.length) text = '';
+    put(els[i], text || '');
+  }
+  var filled = els.filter(function (e) { return (e.value || '').length > 0; }).length;
+  if (!filled) return 'empty';
+  return filled < els.length ? 'partial:' + filled + '/' + els.length : 'ok';
 })(%s)
 """
 
 
 def fill_text(win, text: str):
-    """填主观题的输入框。返回 'ok' / 'no-input' / 'empty'。"""
+    """填主观题/填空题的输入框。返回 ok / no-input / empty / partial:n/m。"""
     import json as _json
 
-    if not (text or '').strip():
-        return 'empty'
-    return _js(win, FILL_JS % _json.dumps(text, ensure_ascii=False)) or 'no-input'
+    if not (text or "").strip():
+        return "empty"
+    # 多空的答案按行或分号切开，一道一段
+    parts = [p.strip() for p in re.split(r"[\n;；]+", text) if p.strip()]
+    if len(parts) <= 1:
+        parts = [text.strip()]
+    return _js(win, FILL_JS % _json.dumps(parts, ensure_ascii=False)) or "no-input"
 
 
-def pick_keys(options, answer: str):
-    """把模型的答案映射到真实选项 key（选项顺序被平台打乱过）。"""
-    text = (answer or "").strip()
-    if not text:
-        return []
-
-    real = {o["key"].lower(): o["key"] for o in options}
-    if "true" in real or "false" in real:
-        low = text.lower()
-        yes = ("正确", "对", "√", "是", "true", "t", "yes", "y")
-        no = ("错误", "错", "×", "否", "false", "f", "no", "n")
-        if any(w in text for w in yes) or low in yes:
-            return [real.get("true", "true")]
-        if any(w in text for w in no) or low in no:
-            return [real.get("false", "false")]
-        return []
-
-    letters = re.findall(r"[A-Za-z]", text)
-    if letters and len(text) <= 8:
-        shown = {o["shown"].upper(): o["key"] for o in options if o.get("shown")}
-        keys = []
-        for ch in letters:
-            k = shown.get(ch.upper())
-            if k and k not in keys:
-                keys.append(k)
-        if keys:
-            return keys
-
-    keys = []
-    for o in options:
-        ot = (o.get("text") or "").strip()
-        if ot and (ot in text or text in ot) and o["key"] not in keys:
-            keys.append(o["key"])
-    return keys
 
 
 def _library():
@@ -481,6 +463,32 @@ def cached_answer(q, fp: str) -> tuple:
     return shared, "shared"
 
 
+def _picked_ok(cur: str, keys: list, qtype: str = "") -> bool:
+    """回读校验：选中的选项必须和期望一致。
+
+    以前只判 `cur` 非空，多选点了 A、B 里只进去 A 也算成功 —— 少选是 0 分，
+    而且答题卡会把这题记成已答，最后照常交卷，等于白丢分。
+    """
+    text = str(cur or "").strip()
+    if not text:
+        return False
+    if (qtype or "").lower() in ("judgement", "judge"):
+        return True                     # 判断题字段里是 true/false，非空即已写入
+    want = {str(k).strip().upper() for k in keys if str(k).strip()}
+    if not want:
+        return False
+    # 只看 ASCII 字母数字：平台如果把选项原文写进字段，中文会被 isalnum 当成
+    # 合法字符，混进集合里变成误判。
+    got = {ch.upper() for ch in text if ch.isascii() and ch.isalnum()}
+    if not got:
+        # 认不出平台把答案写成了什么格式：退回「非空即成功」，
+        # 宁可放过一次也不要因为校验把已经写好的答案判死
+        return True
+    if all(len(k) == 1 for k in want):
+        return got == want
+    return want.issubset(got)
+
+
 def solve_current(win, log=print):
     """作答当前这一题并复查。返回 'ok' / 'already' / 'subjective' / 'fail'。"""
     info = read_question(win)
@@ -488,9 +496,12 @@ def solve_current(win, log=print):
         return "fail"
 
     prog = info.get("progress", "")
+    pace = exam_pace()
 
-    # 主观题：现在走浏览器输入框，能真的填进去（以前只能跳过）
-    if info.get("hasTextarea") or info["typeName"] in SUBJECTIVE:
+    # 主观题 / 填空题：走输入框。
+    # 填空题有的是单行 input（没有 textarea），以前落到客观题分支，没选项直接判失败。
+    if (info.get("hasTextarea") or info["typeName"] in SUBJECTIVE
+            or info["typeName"] == "填空题"):
         if info.get("answered"):
             log(f"  [{prog}] 已有答案，跳过")
             return "already"
@@ -506,6 +517,11 @@ def solve_current(win, log=print):
         if result == "ok":
             log(f"  [{prog}] {info['typeName'] or '主观题'} 已填写 {len(answer)} 字")
             return "ok"
+        if result.startswith("partial:"):
+            # 多空题只填上了一部分：如实报出来，别让「已答」掩盖空白
+            log(f"  [{prog}] {info['typeName'] or '填空题'} 只填上 {result[8:]} 个空，"
+                f"缺的空请自己补")
+            return "ok"
         log(f"  [{prog}] 主观题填不进去（{result}）")
         return "fail"
 
@@ -515,11 +531,23 @@ def solve_current(win, log=print):
                      title=clean_title(info["title"]), options=options,
                      type_name=info["typeName"])
 
-    if info.get("answered"):
-        # 不把页面上的既有答案写进题库：它可能是旧版本错位留下的错误答案，
-        # 也可能是用户手填的，来源不可验证。入库会让错误一直传下去。
-        log(f"  [{prog}] 已有答案 {info['answered']!r}（沿用，不入库）")
-        return "already"
+    answered = str(info.get("answered") or "").strip()
+    already_keys: set = set()
+    if answered:
+        # 多选只勾了一个也会被答题卡算成「已答」，而少选在平台上是 0 分。
+        # 所以多选不直接跳过：继续问一次，只补没勾上的，不动已经勾好的。
+        single_letter_keys = all(len(str(o.get("key") or "")) == 1 for o in info["options"])
+        if q.qtype == "multiple" and single_letter_keys:
+            already_keys = {ch.upper() for ch in answered if ch.isalnum()}
+            if len(already_keys) >= len(info["options"]):
+                log(f"  [{prog}] 已全选（{answered!r}），跳过")
+                return "already"
+            log(f"  [{prog}] 已有答案 {answered!r}，稍后只补没勾上的")
+        else:
+            # 不把页面上的既有答案写进题库：它可能是旧版本错位留下的错误答案，
+            # 也可能是用户手填的，来源不可验证。入库会让错误一直传下去。
+            log(f"  [{prog}] 已有答案 {answered!r}（沿用，不入库）")
+            return "already"
 
     if not options:
         log(f"  [{prog}] 没解析到选项")
@@ -532,33 +560,47 @@ def solve_current(win, log=print):
     keys, answer, evidence = [], "", ""
     hit, where = cached_answer(q, fp)
     if hit:
-        keys = pick_keys(info["options"], hit)
+        match = resolve([hit], info["options"], q.qtype)
+        keys = list(match.keys)
         if keys:
             answer, evidence = hit, where
             log(f"  [{prog}] 题库命中（{'共享' if where == 'shared' else '本地已确认'}）"
-                f"：{hit[:26]}")
+                f"：{hit[:26]}（{match.method}）")
 
     if not keys:
-        log(f"  [{prog}] 正在问模型（双答核对）…")
-        for _ in range(2):
-            answer, agreed = ask_with_check(q, log)
-            keys = pick_keys(info["options"], answer)
+        # 单答打分：只有低置信 / 有歧义 / 没选出时才补一次复核。
+        # 以前是无条件双答 + 最多两轮，最坏 6 次调用，一半 token 花在复核上。
+        log(f"  [{prog}] 正在问模型（单答打分）…")
+        scored, match = answer_objective(q, log, gate=pace["conf_gate"])
+        if scored is not None:
+            keys = list(match.keys)
             if keys:
-                evidence = "ai_agree" if agreed else "model"
-                break
+                evidence = "ai_score" if scored.calls == 1 else "ai_recheck"
+                by_key = {o["key"]: (o.get("text") or "") for o in info["options"]}
+                answer = "、".join(by_key.get(k, "") for k in keys).strip()
+                log(f"  [{prog}] 模型作答 把握 {scored.confidence:.2f}"
+                    f"{'（复核过）' if scored.calls > 1 else ''}")
     if not keys:
         log(f"  [{prog}] 没拿到可用答案")
         return "fail"
 
     # 目标正确率低于 100% 时，按比例故意留错，避免整卷满分显得异常
     forced_wrong = False
-    pace = exam_pace()
     if _should_miss(pace["accuracy"]):
         flipped = _wrong_keys(info["options"], keys)
         if flipped != keys:
             keys = flipped
             forced_wrong = True
             log(f"  [{prog}] 按目标正确率 {pace['accuracy']:.0f}% 故意答错这题（不入题库）")
+
+    # 多选已经有部分答案时，只补没勾上的，别把已经勾好的取消掉
+    all_keys = list(keys)
+    if already_keys:
+        missing = [k for k in keys if str(k).upper() not in already_keys]
+        if not missing:
+            log(f"  [{prog}] 现有答案已经覆盖本题，跳过")
+            return "already"
+        keys = missing
 
     # 点完必须回读，没写进去就重试；用轮询等而不是固定延时，
     # 慢页面上也能等到答案真正落到字段里
@@ -572,73 +614,23 @@ def solve_current(win, log=print):
             "if(!w)return '';var a=w.querySelector(\"input[id^='answer']\");"
             "return a?a.value:'';})()",
             timeout=3.0, interval=0.2) or ''
-        if cur:
-            if evidence in ("ai_agree", "model") and not forced_wrong:
-                remember(q, info, keys, evidence)
-            log(f"  [{prog}] 已作答 {keys} = {cur!r} <- {answer[:26]}")
+        if _picked_ok(cur, all_keys, q.qtype):
+            if evidence in ("ai_score", "ai_recheck") and not forced_wrong:
+                remember(q, info, all_keys, evidence)
+            log(f"  [{prog}] 已作答 {all_keys} = {cur!r} <- {answer[:26]}")
             return "ok"
     log(f"  [{prog}] 点了三次都没写进答案")
     return "fail"
 
 
-SUBMIT_FIND = r"""
-(function () {
-  var bs = document.querySelectorAll('a,button');
-  for (var i = 0; i < bs.length; i++) {
-    var t = (bs[i].innerText || '').replace(/\\s+/g, '');
-    if (/^(交卷|提交试卷|提交答卷|立即交卷)$/.test(t)) {
-      window.__cxSubmit = bs[i];
-      return t;
-    }
-  }
-  return '';
-})()
-"""
-
-SUBMIT_CONFIRM = r"""
-(function () {
-  var bs = document.querySelectorAll('a,button,.btn,span');
-  for (var i = 0; i < bs.length; i++) {
-    var t = (bs[i].innerText || '').replace(/\\s+/g, '');
-    if (/^(确定|确认|确认交卷|确定交卷)$/.test(t)) { bs[i].click(); return t; }
-  }
-  return '';
-})()
-"""
-
-SUBMIT_STATE = r"""
-(function () {
-  var txt = document.body.innerText || '';
-  if (/考试已提交|已交卷|提交成功|交卷成功|考试结束/.test(txt)) return 'done';
-  if (!document.querySelector('.questionWrap')) return 'gone';
-  return '';
-})()
-"""
-
-
-def submit_paper(win, log=print) -> bool:
-    """点交卷。只在答题卡确认全部作答后才会被调用。"""
-    label = _js(win, SUBMIT_FIND)
-    if not label:
-        log("没找到交卷按钮，请在窗口里手动点交卷")
-        return False
-
-    log(f"找到「{label}」按钮，正在交卷")
-    _js(win, "window.__cxSubmit && window.__cxSubmit.click()")
-    time.sleep(2.0)
-
-    confirmed = _js(win, SUBMIT_CONFIRM)
-    if confirmed:
-        log(f"已确认「{confirmed}」")
-        time.sleep(2.0)
-
-    state = _js(win, SUBMIT_STATE)
-    if state in ("done", "gone"):
-        log("交卷完成")
-        return True
-
-    log("点了交卷，但没看到「已提交」的迹象，请到考试窗口里确认一下")
-    return False
+def _log_stats(log=print) -> None:
+    """把本次考试的模型用量写进日志，方便回头看「一门课到底花了多少」。"""
+    st = exam_stats()
+    total = st["prompt"] + st["completion"]
+    if not st["calls"]:
+        return
+    log(f"本次考试模型调用 {st['calls']} 次，约 {total} tokens"
+        f"（输入 {st['prompt']} / 输出 {st['completion']}）")
 
 
 def run_pass(win, log=print, rounds: int = 3, deadline_minutes: float = 25,
@@ -655,11 +647,12 @@ def run_pass(win, log=print, rounds: int = 3, deadline_minutes: float = 25,
         set_course_name(course)
 
     deadline = _t.time() + deadline_minutes * 60
-    started = _t.time()
     pace = exam_pace()
+    reset_exam_stats()
     _MISS["n"] = 0
     _SHARED["dead"] = False
-    stats = {"ok": 0, "fail": 0, "left": 0, "error": "", "submitted": False}
+    stats = {"ok": 0, "fail": 0, "left": 0, "error": "", "submitted": False,
+             "ready": False}
     for rnd in range(rounds):
         if _t.time() > deadline:
             log(f"已到 {deadline_minutes:g} 分钟上限，先停在这里")
@@ -705,7 +698,9 @@ def run_pass(win, log=print, rounds: int = 3, deadline_minutes: float = 25,
         drain_dialogs(win, log)
         if not undone:
             stats["left"] = 0
-            return stats
+            # 不能在这里 return：底部还有「收尾判定 + 用量统计」。
+            # 直接返回的话 stats 不完整，调用方会以为这一轮没跑完。
+            break
 
         # 从第 1 题顺序翻到卷尾：不靠答题卡乱跳，阅读顺序也更符合直觉
         if not goto_first(win, log):
@@ -730,7 +725,6 @@ def run_pass(win, log=print, rounds: int = 3, deadline_minutes: float = 25,
             if qid:
                 seen.add(qid)
 
-            prog = info.get("progress", "")
             status = solve_current(win, log)
             drain_dialogs(win, log)
             if status == "ok":
@@ -755,24 +749,19 @@ def run_pass(win, log=print, rounds: int = 3, deadline_minutes: float = 25,
         if card["undone"]:
             log("仍未作答：" + "、".join(card["undone"][:20]))
 
+    # 交卷一律由人来做：交卷不可逆，而且卷面上还有程序判断不了的东西
+    # （主观题写得够不够、图片题、老师临时加的说明）。程序只负责把题答完，
+    # 然后明确告诉你「可以交了」，绝不替用户点那个按钮。
     stats["submitted"] = False
     if stats["error"]:
-        # 读不到题目状态就什么都不交，免得把空卷递上去
-        log("没能读到答题卡，这一轮不做任何提交")
+        log("没能读到答题卡，请到考场窗口里确认状态")
+        _log_stats(log)
         return stats
 
-    # 只有确认全部作答才交卷；有未答就留着让人处理，绝不交白卷
     if stats.get("left", 1) == 0:
-        # 太快交卷也像机器人：先补足整卷最少用时，再停顿一下
-        if pace["min_minutes"]:
-            remain = pace["min_minutes"] * 60 - (_t.time() - started)
-            if remain > 1:
-                log(f"按要求放慢节奏：再等 {int(remain)} 秒后交卷")
-                _t.sleep(remain)
-        if pace["hold"]:
-            log(f"交卷前停顿 {int(pace['hold'])} 秒")
-            _t.sleep(pace["hold"])
-        stats["submitted"] = submit_paper(win, log)
+        stats["ready"] = True
+        log("全部题目已作答，请在考场窗口里检查后手动交卷")
     else:
-        log(f"还有 {stats.get('left', 0)} 题没答完，不自动交卷")
+        log(f"还有 {stats.get('left', 0)} 题没答完，请到考场窗口补齐后再交卷")
+    _log_stats(log)
     return stats

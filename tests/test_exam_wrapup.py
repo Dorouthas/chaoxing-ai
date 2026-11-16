@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """考试收尾逻辑的回归测试。
 
-重点是一条：卷上有主观题（程序不支持作答）时不能自动交卷，
-否则那几道题直接记 0 分且不可更改。
+规矩只有一条：**程序永远不交卷**。
+交卷不可逆，而且卷面上有程序判断不了的东西（主观题、图片题、老师临时说明），
+所以答完只回调「可以交了」，由使用者自己点。
+
+以前的用例断言「全客观题时会自动交卷」，现在反过来：任何情况下都不许调用
+final_submit。这条断言就是防止哪天有人把自动交卷又加回去。
 """
 import os
 import sys
@@ -95,12 +99,12 @@ def _draft_file():
 
 
 class ExamWrapUpTest(unittest.TestCase):
-    def test_all_objective_submits_paper(self):
-        """全是客观题：正常交卷。"""
+    def test_all_objective_never_submits(self):
+        """全是客观题：答完也不交，交卷交给使用者。"""
         count, final, flags = _run([_question(0), _question(1)])
         self.assertEqual(count, 2)
-        self.assertTrue(final)
-        self.assertEqual(flags, [True])
+        self.assertFalse(final, "程序不允许自动交卷")
+        self.assertEqual(flags, [False])
 
     def test_subjective_blocks_submission(self):
         """有主观题没作答：不许自动交卷，并回调 False。"""
@@ -137,12 +141,12 @@ class ExamWrapUpTest(unittest.TestCase):
         self.assertFalse(final)
         self.assertEqual(flags, [False])
 
-    def test_saved_answers_still_submit(self):
-        """卷面答案都已存在（saved_answer）时，虽然本次没新交题，也应当交卷。"""
+    def test_saved_answers_never_submit(self):
+        """卷面答案都已存在时也不交卷。"""
         count, final, flags = _run([_question(0, saved="A"), _question(1, saved="B")])
         self.assertEqual(count, 0)
-        self.assertTrue(final)
-        self.assertEqual(flags, [True])
+        self.assertFalse(final, "程序不允许自动交卷")
+        self.assertEqual(flags, [False])
 
 
 if __name__ == "__main__":

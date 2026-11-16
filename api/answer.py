@@ -596,7 +596,8 @@ class TikuYanxi(Tiku):
                 # 'type':q_info['type'], #修复478题目类型与答案类型不符（不想写后处理了）
                 # 没用，就算有type和options，言溪题库还是可能返回类型不符，问了客服，type仅用于收集
             },
-            verify=False
+            verify=False,
+            timeout=20,   # 题库挂掉时不能把整条答题链路一起拖死
         )
         if res.status_code == 200:
             res_json = res.json()
@@ -1151,7 +1152,8 @@ class TikuAdapter(Tiku):
                 'options': [sub(r'^[A-Za-z]\.?、?\s?', '', option) for option in options.split('\n')],
                 'type': type
             },
-            verify=False
+            verify=False,
+            timeout=20,   # 同上：题库超时当作没查到，不能无限等
         )
         if res.status_code == 200:
             res_json = res.json()

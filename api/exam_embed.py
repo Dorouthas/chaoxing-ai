@@ -67,7 +67,27 @@ _POLL = 0.25
 
 
 def _hwnd_of(win) -> int:
-    handle = win.native.Handle
+    """取窗口的原生句柄，尽量在 UI 线程上取。
+
+    WinForms 的句柄是惰性创建的：谁先访问 `Handle`，句柄就建在谁的线程上。
+    attach() 跑在后台线程，如果它抢在 UI 线程之前碰到句柄，句柄就落在一个
+    没有消息循环的线程上，之后所有 form.Invoke 都会永久阻塞（表现为整个界面卡死）。
+    所以优先切回 UI 线程取；取不到再退回旧行为，宁可偶发卡顿也不让嵌入功能失效。
+    """
+    form = getattr(win, "native", None)
+    if form is None:
+        raise RuntimeError("窗口还没建好")
+
+    handle = None
+    try:
+        from api.browser_unlock import _on_ui
+
+        handle = _on_ui(form, lambda: form.Handle, default=None)
+    except Exception:
+        handle = None
+    if handle is None:
+        handle = form.Handle
+
     return int(handle.ToInt64() if hasattr(handle, "ToInt64") else handle)
 
 

@@ -89,6 +89,23 @@ def port_in_use() -> bool:
         return sock.connect_ex((HOST, PORT)) == 0
 
 
+def port_is_ours() -> bool:
+    """5000 上的服务是不是我们的界面。
+
+    只看端口是否被占用是不够的：别的程序占着 5000 时，程序会以为自己的服务
+    已经起来了，然后把别人的页面加载进窗口，所有接口都 403。
+    这里读一眼首页，认我们的 token 标记。
+    """
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(f"{URL}/", timeout=2) as resp:
+            html = resp.read(4096).decode("utf-8", "replace")
+        return 'name="cx-token"' in html
+    except Exception:
+        return False
+
+
 def run_server() -> None:
     from webui.server import app
 
@@ -242,6 +259,14 @@ def launch_window() -> None:
 
     def quit_app(*_args) -> None:
         state["quitting"] = True
+        # 先武装兜底再动窗口：exam.destroy()/window.destroy() 会阻塞等 UI 线程，
+        # 真卡住时下面的收尾代码根本执行不到，进程会带着 ui.lock 一起僵死，
+        # 下次启动就变成「提示已经在运行但找不到窗口」。
+        def _force_exit() -> None:
+            time.sleep(3.0)
+            os._exit(0)
+
+        threading.Thread(target=_force_exit, daemon=True).start()
         try:
             from webui.server import append_ui_log
 
@@ -254,6 +279,14 @@ def launch_window() -> None:
             from webui.server import kill_task_process
 
             kill_task_process()
+        except Exception:
+            pass
+        # 用户点完「登录学习通」没登录就退出时，登录态还躺在 .bak 里。
+        # 不搬回来，下次启动界面就是「未登录」，明明有能用的会话。
+        try:
+            from webui.server import rescue_login_backup_on_quit
+
+            rescue_login_backup_on_quit()
         except Exception:
             pass
         try:
@@ -275,13 +308,7 @@ def launch_window() -> None:
             window.destroy()
         except Exception:
             pass
-        # 兜底：窗口关不掉时进程会残留，托盘已经没了却还占着单实例锁，
-        # 下次启动就变成「提示已经在运行但找不到窗口」。3 秒后自己收尾。
-        def _force_exit() -> None:
-            time.sleep(3.0)
-            os._exit(0)
-
-        threading.Thread(target=_force_exit, daemon=True).start()
+        # 兜底线程已在函数开头启动，这里只等它收尾
 
     def on_closing():
         # 关窗口只是收进托盘，程序继续在后台跑
@@ -381,7 +408,13 @@ def main() -> None:
     except Exception:
         pass
 
-    if not port_in_use():
+    if port_in_use():
+        if not port_is_ours():
+            notify("端口 5000 被其它程序占用了，本程序没法启动界面。\n\n"
+                   "请先关掉占用 5000 端口的程序（常见是别的本地服务或旧的调试进程），"
+                   "再重新打开本程序。")
+            return
+    else:
         threading.Thread(target=run_server, daemon=True).start()
         wait_ready()
         try:

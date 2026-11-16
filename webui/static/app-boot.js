@@ -16,8 +16,7 @@
       $('acc-val').textContent = Math.round(c.target_accuracy) + '%';
     }
     if (c.exam_answer_gap !== undefined) $('exam_answer_gap').value = c.exam_answer_gap;
-    if (c.exam_min_minutes !== undefined) $('exam_min_minutes').value = c.exam_min_minutes;
-    if (c.exam_hold_seconds !== undefined) $('exam_hold_seconds').value = c.exam_hold_seconds;
+    if (c.exam_conf_gate !== undefined) $('exam_conf_gate').value = c.exam_conf_gate;
     if (c.reasoning_effort) $('reasoning_effort').value = c.reasoning_effort;
     $('submit').checked = c.submit !== false;
     $('work_redo_enabled').checked = !!c.work_redo_enabled;

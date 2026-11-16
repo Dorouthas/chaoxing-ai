@@ -1,7 +1,7 @@
 """考试自动答题。
 
 流程：解析考试封面 → 开始 → 逐题拉取（服务端渲染的 HTML）→ 解析
-→ 先查题库、未命中再问模型 → 逐题提交 → 交卷。
+→ 先查题库、未命中再问模型 → 逐题提交（不交卷，交卷由使用者手动完成）。
 
 人脸验证：检测到就抛 FaceRequired，由界面提示使用者自己完成，
 程序不参与、不伪造任何活体信息。
@@ -20,10 +20,11 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Tag
 
 from api.library import Library, fingerprint
 from api.logger import logger
+from api.matcher import MatchResult, score_to_keys
 
 COVER_URL = "https://mooc1-api.chaoxing.com/exam-ans/exam/phone/task-exam"
 START_URL = "https://mooc1-api.chaoxing.com/exam-ans/exam/phone/start"
@@ -667,13 +668,6 @@ class ExamSession:
             self._sync_from_data(data.get("data"))
         return data
 
-    def final_submit(self) -> dict:
-        """直接交卷（不提交具体题目）。"""
-        blank = ExamQuestion(index=0, qid="", qtype="other", title="")
-        # 交卷和逐题提交打的是同一个接口，试卷页那批结构性字段（paperId、openc 等）
-        # 少一个平台就回「无效操作」，所以这里也必须带上。
-        return self.submit(blank, "", final=True,
-                           page_fields=form_payload(self.last_html))
 
 
 # ---------- 作答 ----------
@@ -757,13 +751,6 @@ _ANALYZE = ("答题前先在内部逐个分析每个选项：它符合教材表�
             "结论里不要写分析过程。")
 
 
-def _same_answer(question: "ExamQuestion", a: str, b: str) -> bool:
-    """两次答案是不是同一个。归一化后比较，避开写法差异。"""
-    from api.library import normalize_answer
-
-    key_a = normalize_answer(a, question.qtype, question.options_text)
-    key_b = normalize_answer(b, question.qtype, question.options_text)
-    return bool(key_a) and key_a == key_b
 
 
 def ask_ai(question: ExamQuestion, variant: int = 0) -> Optional[str]:
@@ -776,12 +763,9 @@ def ask_ai(question: ExamQuestion, variant: int = 0) -> Optional[str]:
     if not (conf.get("endpoint") and conf.get("key")):
         return None
 
-    try:
-        from openai import OpenAI
-    except Exception:
+    client = _openai_client(conf)
+    if client is None:
         return None
-
-    client = OpenAI(base_url=conf["endpoint"], api_key=conf["key"], timeout=90)
     prompt = _PROMPTS.get(question.qtype, _PROMPTS["shortanswer"])
     if variant:
         prompt = _SECOND_PASS + prompt
@@ -820,30 +804,340 @@ def ask_ai(question: ExamQuestion, variant: int = 0) -> Optional[str]:
             logger.error(f"模型调用失败：{exc}")
             return None
 
+    _count_usage(completion, len(system_text) + len(user_text))
+
     content = completion.choices[0].message.content or ""
     if not content:
         content = getattr(completion.choices[0].message, "reasoning_content", "") or ""
 
     text = content.strip()
-    matched = re.search(r"\{.*\}", text, re.S)
-    if matched:
-        try:
-            data = json.loads(matched.group(0))
-            items = data.get("Answer") or data.get("answer")
-            if isinstance(items, str):
-                items = [items]
-            if items:
-                return "\n".join(str(x) for x in items).strip()
-        except Exception:
-            pass
+    data = _extract_json(text)
+    if data:
+        items = data.get("Answer") or data.get("answer")
+        if isinstance(items, str):
+            items = [items]
+        if items:
+            return "\n".join(str(x) for x in items).strip()
     return text[:2000] if text else None
 
 
-_PACE_DEFAULTS = {"gap": 3.0, "min_minutes": 0.0, "hold": 0.0, "accuracy": 100}
+# ---------- 选项级打分：考试客观题的主链路 ----------
+# 为什么不直接让模型「给答案」：
+#   1. 整题答案要模型自己数几个，多选经常数错；逐项打分不会数错；
+#   2. 每题都有分数，程序才能按阈值和领先度决定「要不要复核」，
+#      而不是无条件问第二遍 —— 这是省 token 的关键；
+#   3. 分数本身就是置信度，低分的题才值得花第二次调用。
+
+_STATS = {"calls": 0, "prompt": 0, "completion": 0}
+
+
+def reset_exam_stats() -> None:
+    _STATS.update(calls=0, prompt=0, completion=0)
+
+
+def exam_stats() -> dict:
+    """本次考试累计的调用次数与 token（拿不到 usage 时按字数粗估）。"""
+    return dict(_STATS)
+
+
+def _count_usage(completion, prompt_chars: int = 0) -> None:
+    _STATS["calls"] += 1
+    try:
+        usage = getattr(completion, "usage", None)
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        out = int(getattr(usage, "completion_tokens", 0) or 0)
+        if prompt or out:
+            _STATS["prompt"] += prompt
+            _STATS["completion"] += out
+            return
+    except Exception:
+        pass
+    # 拿不到 usage 就按字符数粗估，宁可不准也不能让统计把答题带崩
+    _STATS["prompt"] += max(1, prompt_chars // 2)
+
+
+def _extract_json(text: str):
+    """从模型输出里取第一个 JSON 对象。
+
+    以前用贪婪的 `\\{.*\\}`：输出里出现两个对象、或正文带右花括号时直接解析失败，
+    整题被当成「没答案」；没有右花括号时还会退化成平方级回溯。
+    这里改成 raw_decode 扫描，稳一点。
+    """
+    if not text:
+        return None
+    raw = str(text).strip()
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(raw):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(raw[i:])
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+
+    matched = re.search(r"\{.*?\}", raw, re.S)
+    if matched:
+        try:
+            obj = json.loads(matched.group(0))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _openai_client(conf: dict):
+    """复用 OpenAI 客户端。
+
+    以前每题都新建一个，底层 httpx 连接从不关闭，一场 85 题的考试会漏一串连接；
+    顺带把 max_retries 压到 1，避免单题最坏等 3×90 秒把整卷时间吃穿。
+    """
+    key = (str(conf.get("endpoint") or ""), str(conf.get("key") or ""))
+    if not key[0] or not key[1]:
+        return None
+    client = _CLIENTS.get(key)
+    if client is None:
+        try:
+            from openai import OpenAI
+        except Exception:
+            return None
+        client = OpenAI(base_url=key[0], api_key=key[1], timeout=45, max_retries=1)
+        _CLIENTS[key] = client
+    return client
+
+
+_CLIENTS: dict = {}
+
+
+@dataclass
+class ScoredAnswer:
+    """一次（或两次合并后的）选项级打分。"""
+
+    items: list                 # [{"k": "A", "v": 0.93}]
+    confidence: float = 0.0     # 整题把握
+    reason: str = ""
+    variant: int = 0
+    calls: int = 1
+    raw: str = ""
+    ambiguous: bool = False     # 合并/复核产生了分歧，建议人工看一眼
+
+    def top(self, n: int = 1) -> list:
+        return sorted(self.items, key=lambda x: x.get("v", 0), reverse=True)[:n]
+
+
+def labeled_options(question: "ExamQuestion") -> list:
+    """把选项按展示顺序编号成 A/B/C…，返回 [(label, key, text)]。
+
+    不依赖平台给的字母：超星单选 key 通常是 A/B/C，判断题是 true/false，
+    统一编号后模型只看 A/B/C，映射由程序负责，从根上消掉字母错位。
+    """
+    out = []
+    for i, (key, text) in enumerate((question.options or {}).items()):
+        label = chr(ord("A") + i) if i < 26 else str(i + 1)
+        out.append((label, str(key), str(text)))
+    return out
+
+
+def _scored_prompt(question: "ExamQuestion", opts: list, variant: int = 0):
+    if question.qtype == "multiple":
+        task = "本题为多选题：多个选项可以同时成立，请对每个选项独立判断"
+    elif question.qtype == "judgement":
+        task = "本题为判断题：两个选项里只有一个成立"
+    else:
+        task = "本题为单选题：只有一个选项成立"
+
+    if variant:
+        # 中立复核：不是「先假定全错」——正确性是正面事实，让模型证明
+        # 「没错」会系统性压低难以自证的正确项，两轮一平均就把对的翻成错的。
+        rule = ("独立复核：不要受任何既有结论影响，逐项重新判断该选项是否成立，"
+                "并给出你自己的把握。")
+    else:
+        rule = ("逐项判断：该选项是否符合教材表述和题目要求。"
+                "把握越高分越高，明显背离给低分。")
+
+    system = (_role_prefix() + task + "。" + rule +
+              '只输出 json：{"items":[{"k":"A","v":0.93}],"c":0.86}。'
+              "k 是选项编号，v 是 0 到 1 的把握，c 是整题把握。"
+              "每个选项都要给出 v，不要省略，也不要输出分析过程。")
+    lines = [f"{label}. {text}" for label, _key, text in opts]
+    user = f"题目：{question.title}\n选项：\n" + "\n".join(lines)
+    return system, user
+
+
+def ask_scored(question: "ExamQuestion", variant: int = 0) -> Optional[ScoredAnswer]:
+    """问一次模型，拿选项级分数。失败返回 None，绝不抛异常打断考试。"""
+    conf = _ai_conf()
+    if not (conf.get("endpoint") and conf.get("key")):
+        return None
+    opts = labeled_options(question)
+    if not opts:
+        return None
+
+    system_text, user_text = _scored_prompt(question, opts, variant)
+    client = _openai_client(conf)
+    if client is None:
+        return None
+    kwargs = {
+        "model": conf["model"],
+        "messages": [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ],
+    }
+
+    completion = None
+    effort = conf.get("reasoning_effort", "")
+    if effort in ("low", "medium", "high"):
+        try:
+            completion = client.chat.completions.create(**kwargs, reasoning_effort=effort)
+        except Exception as exc:
+            logger.warning(f"模型不接受 reasoning_effort，改为普通调用：{exc}")
+            completion = None
+    if completion is None:
+        try:
+            completion = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            logger.error(f"模型调用失败：{exc}")
+            return None
+
+    _count_usage(completion, len(system_text) + len(user_text))
+
+    content = completion.choices[0].message.content or ""
+    if not content:
+        content = getattr(completion.choices[0].message, "reasoning_content", "") or ""
+    text = content.strip()
+
+    data = _extract_json(text)
+    if data is None:
+        logger.debug(f"打分输出里没有 JSON：{text[:120]}")
+        return None
+
+    raw_items = data.get("items") or data.get("Items") or []
+    valid = {label for label, _key, _text in opts}
+    items = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        k = str(it.get("k") or it.get("K") or "").strip().upper()
+        if k not in valid:
+            continue
+        try:
+            v = float(it.get("v", it.get("V", 0)))
+        except (TypeError, ValueError):
+            continue
+        items.append({"k": k, "v": max(0.0, min(1.0, v))})
+
+    if not items:
+        return None
+
+    missing = [label for label, _key, _text in opts if label not in {i["k"] for i in items}]
+
+    try:
+        conf_value = float(data.get("c", data.get("C", 0)) or 0)
+    except (TypeError, ValueError):
+        conf_value = 0.0
+    if not conf_value:
+        conf_value = max(i["v"] for i in items)
+    if missing:
+        # 模型漏了选项（多选常见）：不能当成「漏掉的就是 0 分」，
+        # 也不能按已给出的项算高置信，直接压到 0 让它走一遍复核。
+        conf_value = 0.0
+
+    return ScoredAnswer(items=items, confidence=max(0.0, min(1.0, conf_value)),
+                        reason=str(data.get("r") or data.get("reason") or "")[:80],
+                        variant=variant, calls=1, raw=text[:400])
+
+
+def scored_to_keys(scored: ScoredAnswer, question: "ExamQuestion") -> MatchResult:
+    """把选项编号（A/B/C）换回平台真实的选项 key，再按题型聚合。"""
+    opts = labeled_options(question)
+    by_label = {label: key for label, key, _text in opts}
+    items = [{"k": by_label.get(it["k"], it["k"]), "v": it["v"]} for it in scored.items]
+    return score_to_keys(items, question.qtype)
+
+
+def _merge_scored(a: ScoredAnswer, b: ScoredAnswer) -> ScoredAnswer:
+    """合并两轮打分。
+
+    一轮给了分、另一轮没提这个选项时，按「未知」处理（取 0.85 倍），
+    不要当成 0 分去平均 —— 否则 0.8 会被拉成 0.4，多选直接丢一个正确项。
+    但 0.85 倍会把 0.5~0.58 的项拉到 0.5 以下造成漏选（少选即 0 分），
+    所以衰减设了下限：第一轮已过线的项，衰减后最多降到 0.5，并标歧义。
+    """
+    sa = {i["k"]: i["v"] for i in a.items}
+    sb = {i["k"]: i["v"] for i in b.items}
+    keys = list(dict.fromkeys([*sa, *sb]))
+    items = []
+    decayed = False
+    disagree = False
+    for k in keys:
+        av, bv = sa.get(k), sb.get(k)
+        if av is None and bv is None:
+            v = 0.0
+        elif av is None or bv is None:
+            known = av if av is not None else bv
+            v = known * 0.85
+            # 两轮都过线的项衰减后不允许掉出选择集
+            if known >= 0.5 and v < 0.5:
+                v = 0.5
+                decayed = True
+            else:
+                decayed = True
+        else:
+            if abs(av - bv) > 0.3:
+                disagree = True
+            v = (av + bv) / 2
+        items.append({"k": k, "v": round(v, 3)})
+    items.sort(key=lambda x: x["v"], reverse=True)
+    return ScoredAnswer(items=items,
+                        confidence=round((a.confidence + b.confidence) / 2, 3),
+                        reason=a.reason or b.reason, variant=1, calls=2,
+                        ambiguous=decayed or disagree)
+
+
+def answer_objective(question: "ExamQuestion", log=print, gate: float = None):
+    """客观题主链路：先单答打分，只有「低置信 / 有歧义 / 没选出」才补一次复核。
+
+    返回 (ScoredAnswer | None, MatchResult)。命中时 MatchResult.keys 是要点的 key。
+    """
+    if gate is None:
+        gate = _PACE_DEFAULTS["conf_gate"]
+
+    first = ask_scored(question)
+    if first is None:
+        return None, MatchResult()
+
+    result = scored_to_keys(first, question)
+    need_recheck = (not result.keys) or result.ambiguous or first.confidence < gate
+    if not need_recheck:
+        return first, result
+
+    second = ask_scored(question, variant=1)
+    if second is None:
+        return first, result
+
+    merged = _merge_scored(first, second)
+    merged_result = scored_to_keys(merged, question)
+    if merged_result.keys:
+        return merged, merged_result
+    return merged, result
+
+
+# ---------- 考试节奏 ----------
+
+# conf_gate：整题把握低于它才补一次复核。调高更准更贵，调低更省。
+_PACE_DEFAULTS = {"gap": 3.0, "accuracy": 100, "conf_gate": 0.78}
 
 
 def exam_pace() -> dict:
-    """考试节奏：每题间隔、整卷最少用时、交卷前停顿、目标正确率。
+    """考试节奏：每题间隔、目标正确率、复核门槛。
 
     这几个值只影响考试路径，读不到配置就按默认走，绝不因此中断考试。
     """
@@ -862,42 +1156,13 @@ def exam_pace() -> dict:
                 return default
 
         pace["gap"] = num("exam_answer_gap", 3.0, 0.0, 30.0)
-        pace["min_minutes"] = num("exam_min_minutes", 0.0, 0.0, 180.0)
-        pace["hold"] = num("exam_hold_seconds", 0.0, 0.0, 120.0)
         pace["accuracy"] = num("target_accuracy", 100.0, 60.0, 100.0)
+        pace["conf_gate"] = num("exam_conf_gate", 0.78, 0.5, 0.95)
     except Exception:
         pass
     return pace
 
 
-def ask_with_check(question: ExamQuestion, log=print) -> tuple[str, bool]:
-    """问两次独立比对。返回 (答案, 两次是否一致)。
-
-    一致才算「双答确认」；不一致时再问一次取多数，仍然不一致就只当待验证，
-    绝不把它当可信答案。
-    """
-    first = ask_ai(question)
-    if not first:
-        return "", False
-    if question.qtype not in OBJECTIVE_TYPES:
-        return first, False
-
-    second = ask_ai(question, variant=1)
-    if not second:
-        return first, False
-    if _same_answer(question, first, second):
-        log("    双答一致，记为已确认")
-        return first, True
-
-    third = ask_ai(question)
-    if third and _same_answer(question, first, third):
-        log("    双答不一致，第三次支持第一答案，采用")
-        return first, True
-    if third and _same_answer(question, second, third):
-        log("    双答不一致，第三次支持第二答案，采用")
-        return second, True
-    log("    双答不一致且无法定论，本题答案只作待验证")
-    return first, False
 
 
 def resolve_answer(question: ExamQuestion, library: Library) -> tuple[str, str]:
@@ -1030,7 +1295,7 @@ def run_exam(session: requests.Session, course: dict, exam_id, enc_task,
     """完整跑一场考试，返回已提交的题目数。
 
     wait_face(session) 在需要人脸时被调用，返回 True 表示使用者已自行完成验证。
-    on_finish(submitted) 在结束时回调，submitted=False 表示有主观题没作答、故意没交卷。
+    on_finish 在结束时回调，参数恒为 False —— 程序不再交卷，交卷由使用者手动完成。
     attach=True 时不自己开始考试，而是接管使用者已经点开的那场。
     retake=True 时先发起重考，再走正常流程。
     enc/answer_id 有值时直接用它进入答题（enc 由内嵌浏览器抓取，验证码已由浏览器过掉）。
@@ -1143,25 +1408,21 @@ def run_exam(session: requests.Session, course: dict, exam_id, enc_task,
             saved = _save_subjective(subjective_answers)
             if saved:
                 log(f"这 {len(subjective_answers)} 道主观题的参考答案已存到：{saved}")
-        log("为避免这些题交白卷，本次不自动交卷。请把主观题填完后再自行提交。")
+        log("本程序不交卷。请把主观题填完、检查整卷后自行提交。")
         if on_finish:
             on_finish(False)
         return answered
 
     if answered + already == 0:
-        log("本次一道题都没答上（请检查题库和模型配置），为避免交白卷，不自动交卷")
+        log("本次一道题都没答上（请检查题库和模型配置）；程序不交卷，避免交白卷")
         if on_finish:
             on_finish(False)
         return 0
 
-    try:
-        sess.final_submit()
-        log(f"已交卷，共提交 {answered} 道题")
-        if on_finish:
-            on_finish(True)
-    except ExamError as exc:
-        log(f"交卷失败：{exc}")
-        if on_finish:
-            on_finish(False)
+    # 交卷一律由人来做。这条 HTTP 路径本来也已经废弃（/api/exam/run 返回 410），
+    # 但保留代码时也要守住同一条规矩：程序只答，不交。
+    log(f"已作答 {answered} 道题，请在平台里检查后手动交卷")
+    if on_finish:
+        on_finish(False)
 
     return answered

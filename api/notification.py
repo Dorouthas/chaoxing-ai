@@ -195,7 +195,7 @@ class ServerChan(NotificationService):
         }
 
         try:
-            response = requests.post(self.url, json=params, headers=headers)
+            response = requests.post(self.url, json=params, headers=headers, timeout=8)
             response.raise_for_status()
             result = response.json()
             logger.info(f"Server酱通知发送成功: {result}")
@@ -231,7 +231,7 @@ class Qmsg(NotificationService):
         headers = {'Content-Type': 'application/json;charset=utf-8'}
 
         try:
-            response = requests.post(self.url, params=params, headers=headers)
+            response = requests.post(self.url, params=params, headers=headers, timeout=8)
             response.raise_for_status()
             result = response.json()
             logger.info(f"Qmsg酱通知发送成功: {result}")
@@ -266,7 +266,7 @@ class Bark(NotificationService):
         params = {'body': message}
 
         try:
-            response = requests.post(self.url, params=params)
+            response = requests.post(self.url, params=params, timeout=8)
             response.raise_for_status()
             result = response.json()
             logger.info(f"Bark通知发送成功: {result}")
@@ -305,7 +305,7 @@ class Telegram(NotificationService):
         }
 
         try:
-            response = requests.post(self.url, data=params)
+            response = requests.post(self.url, data=params, timeout=8)
             response.raise_for_status()
             result = response.json()
             if result.get('ok'):

@@ -16,7 +16,7 @@ def save_cookies(session: requests.Session):
         for k, v in session.cookies.items():
             buffer += f"{k}={v};"
         buffer = buffer.removesuffix(";")
-        with open(gc.COOKIES_PATH, "w") as f:
+        with open(gc.COOKIES_PATH, "w", encoding="utf-8") as f:
             f.write(buffer)
 
 
@@ -31,7 +31,7 @@ def use_cookies() -> dict:
 
         cookies = {}
         try:
-            with open(gc.COOKIES_PATH, "r") as f:
+            with open(gc.COOKIES_PATH, "r", encoding="utf-8", errors="replace") as f:
                 buffer = f.read().strip()
                 if not buffer:
                     return {}

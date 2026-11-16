@@ -114,4 +114,5 @@ if WEBUI_MODE:
     except Exception:
         pass
 logger.add(tqdm_sink, colorize=True, enqueue=True)
-logger.add(LOG_FILE, rotation="20 MB", retention=5, level="TRACE", enqueue=True)
+logger.add(LOG_FILE, rotation="20 MB", retention=5, level="TRACE", enqueue=True,
+           encoding="utf-8")

@@ -199,3 +199,7 @@ _build_*.log
 # 运行期与备份产物
 _backup/
 ui.lock
+
+# 临时产物（曾被误提交）
+_r.out
+_v*.json

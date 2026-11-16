@@ -68,9 +68,10 @@ async function loadExamsOnce() {
 
 async function openExamBrowser(group, item, btn, mode) {
   const tip = mode === 'retake'
-    ? '重考「' + item.name + '」？\n\n会打开考试窗口，你在里面点重考并完成验证码，之后程序自动答完整套卷子并交卷。重考次数会用掉一次。'
-    : '开始「' + item.name + '」？\n\n会打开考试窗口，你在里面点进入考试并完成验证码，之后程序自动答题、自动交卷。';
+    ? '重考「' + item.name + '」？\n\n会打开考试窗口，你在里面点重考并完成验证码，之后程序自动答题；答完会提示你检查后手动交卷。重考次数会用掉一次。'
+    : '开始「' + item.name + '」？\n\n会打开考试窗口，你在里面点进入考试并完成验证码，之后程序自动答题；答完会提示你检查后手动交卷。';
   if (!confirm(tip)) return;
+  const label = mode === 'retake' ? '重考' : '开始';
   if (btn) { btn.disabled = true; btn.textContent = '打开中…'; }
 
   const q = new URLSearchParams({
@@ -86,17 +87,27 @@ async function openExamBrowser(group, item, btn, mode) {
     setMsg('考场页面已嵌到下方区域：在里面点「进入考试」并完成验证码，程序会自动接手', 'warn');
     $('exam-hint').textContent = '等待你在下方考场页面里进入考场…';
     $('app').classList.remove('nologs');
+    // 按钮必须复位：以前成功后永远停在「打开中…」，用户以为还在加载
+    if (btn) { btn.disabled = false; btn.textContent = label; }
     watchExamBrowser(group, item, btn);
   } catch (e) {
     alert('打开考试窗口失败：' + e.message);
-    if (btn) { btn.disabled = false; btn.textContent = '开始'; }
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    setMsg('打开考试窗口失败：' + e.message, 'err');
   }
 }
 
+let examWatchGen = 0;
+
 function watchExamBrowser(group, item, btn) {
   if (examTimer) clearInterval(examTimer);
+  // 代次守卫：setInterval 的回调是异步的，fetch 超过 1 秒时下一个 tick 会并发进来，
+  // 两个 tick 都看到 enc 就会发两次 autodrive，第二次拿到 409 后又会重开 watcher，
+  // 反而把刚开始的状态轮询干掉，界面上写「自动作答没能开始」，实际卷子正在答。
+  const gen = ++examWatchGen;
   let ticks = 0;
   examTimer = setInterval(async () => {
+    if (gen !== examWatchGen) return;
     ticks++;
     if (ticks > 420) {
       clearInterval(examTimer); examTimer = null;
@@ -106,6 +117,7 @@ function watchExamBrowser(group, item, btn) {
     try {
       const r = await fetch('/api/exam/browser');
       const d = await r.json();
+      if (gen !== examWatchGen) return;
       if (!d.enc) return;
       clearInterval(examTimer); examTimer = null;
       $('exam-hint').textContent = '已进入考场，开始自动答题…';
@@ -113,10 +125,15 @@ function watchExamBrowser(group, item, btn) {
       try {
         await post('/api/exam/autodrive', {course: (group && group.course) || ''});
       } catch (err) {
+        if (/已经在自动作答/.test(err.message || '')) {
+          // 409 = 另一个 tick 已经启动过了，直接转状态轮询，别再重开 watcher
+          startExamPolling();
+          return;
+        }
         // 这一步失败以前被空 catch 吞掉：界面停在「正在答题」，其实一题没答。
         $('exam-hint').textContent = '自动作答没能开始';
         setMsg('自动作答没能开始：' + err.message, 'err');
-        setTimeout(watchExamBrowser, 2000);
+        setTimeout(() => watchExamBrowser(group, item, btn), 2000);
         return;
       }
       startExamPolling();
@@ -127,6 +144,7 @@ function watchExamBrowser(group, item, btn) {
 }
 
 function startExamPolling() {
+  examWatchGen++;               // 让还在飞的 watcher tick 立刻失效
   if (examTimer) clearInterval(examTimer);
   examTimer = setInterval(async () => {
     try {
@@ -136,13 +154,10 @@ function startExamPolling() {
       if (d.status === 'running') $('exam-hint').textContent = '答题中，已提交 ' + d.answered + ' 题';
       if (d.status === 'done') {
         clearInterval(examTimer); examTimer = null;
-        if (d.submitted) {
-          $('exam-hint').textContent = '已交卷，共提交 ' + d.answered + ' 题';
-          setMsg('考试已交卷', 'ok');
-        } else {
-          $('exam-hint').textContent = '未交卷，已作答 ' + d.answered + ' 题，请到平台手动完成并提交';
-          setMsg('考试未交卷，需要你手动处理', 'warn');
-        }
+        // 交卷由人来做：程序只负责把题答完，然后告诉你可以交了
+        $('exam-hint').textContent =
+          '作答结束（已答 ' + d.answered + ' 题），请在考场窗口里检查后手动交卷';
+        setMsg('作答结束，交卷由你手动完成', 'ok');
         setTimeout(loadExams, 800);
       }
       if (d.status === 'error') {
@@ -309,7 +324,13 @@ $('btnExamClose').onclick = async () => {
       && !confirm('正在自动答题，关掉会中断。确定关闭？')) return;
   $('btnExamClose').hidden = true;
   $('exam-hint').textContent = '';
-  try { await post('/api/exam/browser/close', {}); } catch (e) {}
+  try {
+    await post('/api/exam/browser/close', {});
+  } catch (e) {
+    // 关不掉就把按钮放回来，不然用户连再点一次的入口都没有
+    $('btnExamClose').hidden = false;
+    setMsg('关闭考场失败：' + e.message, 'err');
+  }
 };
 $('btnFaceDone').onclick = async () => {
   try {

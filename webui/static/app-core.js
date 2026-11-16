@@ -87,8 +87,8 @@ function formData() {
     work_redo_enabled: $('work_redo_enabled').checked,
     target_accuracy: parseInt($('target_accuracy').value, 10),
     exam_answer_gap: parseFloat($('exam_answer_gap').value) || 0,
-    exam_min_minutes: parseFloat($('exam_min_minutes').value) || 0,
-    exam_hold_seconds: parseFloat($('exam_hold_seconds').value) || 0,
+    exam_answer_gap: parseFloat($('exam_answer_gap').value) || 0,
+    exam_conf_gate: parseFloat($('exam_conf_gate').value) || 0.78,
     search_url: $('search_url').value.trim(),
     search_key: $('search_key').value.trim(),
     search_enabled: $('search_enabled').checked,
@@ -318,8 +318,8 @@ $('adv-reset').onclick = () => {
   $('target_accuracy').value = 100;
   $('acc-val').textContent = '100%';
   $('exam_answer_gap').value = 3;
-  $('exam_min_minutes').value = 0;
-  $('exam_hold_seconds').value = 0;
+  $('exam_answer_gap').value = 3;
+  $('exam_conf_gate').value = 0.78;
 };
 $('target_accuracy').oninput = (e) => {
   const v = parseInt(e.target.value, 10);

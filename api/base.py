@@ -470,7 +470,7 @@ class Chaoxing:
             "independentId": 0,
         }
         logger.trace("正在尝试登录...")
-        resp = _session.post(_url, headers=gc.HEADERS, data=_data)
+        resp = _session.post(_url, headers=gc.HEADERS, data=_data, timeout=15)
         if resp and resp.json()["status"] == True:
             save_cookies(_session)
             SessionManager.update_cookies()
